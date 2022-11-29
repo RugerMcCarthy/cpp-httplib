@@ -223,7 +223,7 @@ using socket_t = int;
 #include <string>
 #include <sys/stat.h>
 #include <thread>
-
+#include <queue>
 #ifdef CPPHTTPLIB_OPENSSL_SUPPORT
 #ifdef _WIN32
 #include <wincrypt.h>
@@ -278,6 +278,58 @@ inline const unsigned char *ASN1_STRING_get0_data(const ASN1_STRING *asn1) {
  * Declaration
  */
 namespace httplib {
+  class Message {
+    public:
+        Message(std::function<void()> action):action_(action) {}
+        Message(const Message& msg) {
+            action_ = msg.action_;
+        }
+        void operator()() {
+            action_();
+        }
+    private:
+        std::function<void()> action_;
+    };
+    class MessageQueue {
+    private:
+        std::mutex _mutex;
+        std::condition_variable _cv;
+        std::queue<std::shared_ptr<Message>> queue;
+    public:
+        void push(Message message) {
+            std::shared_ptr<Message> msg(new Message(message));
+            std::unique_lock<std::mutex> this_lock(_mutex);
+            queue.push(msg);
+            this_lock.unlock();
+            _cv.notify_one();
+        }
+        std::shared_ptr<Message> poll() {
+            std::unique_lock<std::mutex> this_lock(_mutex);
+            while (!queue.size()) {
+                _cv.wait(this_lock);
+            }
+            std::shared_ptr<Message> msg = queue.front();
+            queue.pop();
+            return msg;
+        }
+        
+    };
+
+    // Looper
+    class Looper {
+    private:
+        MessageQueue queue;
+    public:
+        void loop() {
+            while (true) {
+                std::shared_ptr<Message> msg = queue.poll();
+                (*msg.get())();
+            }
+        }
+        void post(Message message) {
+            queue.push(message);
+        }
+    };
 
 namespace detail {
 
@@ -323,7 +375,8 @@ using Progress = std::function<bool(uint64_t current, uint64_t total)>;
 
 struct Response;
 using ResponseHandler = std::function<bool(const Response &response)>;
-
+class Result;
+using ResponseCallback = std::function<void(Result)>;
 struct MultipartFormData {
   std::string name;
   std::string content;
@@ -605,7 +658,44 @@ private:
   std::condition_variable cond_;
   std::mutex mutex_;
 };
+Looper MainLooper;
 
+class Scheduler {
+  public:
+      virtual void schedule(std::function<void()> callback) = 0;
+};
+
+class MainThreadScheduler: public Scheduler {
+  public:
+      static MainThreadScheduler Default;
+      void schedule(std::function<void()> callback) {
+          MainLooper.post(callback);
+      }
+};
+MainThreadScheduler MainThreadScheduler::Default = MainThreadScheduler();
+class SingleThreadScheduler: public Scheduler {
+public:
+    void schedule(std::function<void()> callback) {
+        std::thread(callback).detach();
+    }
+};
+
+class ThreadPoolScheduler: public Scheduler {
+  private:
+    ThreadPool* pool = nullptr;
+  public:
+    static ThreadPoolScheduler& getInstance() {
+      static ThreadPoolScheduler scheduler;
+      return scheduler;
+    }
+    ThreadPoolScheduler(): ThreadPoolScheduler(CPPHTTPLIB_THREAD_POOL_COUNT) {};
+    ThreadPoolScheduler(size_t pool_size) {
+        pool = new ThreadPool(pool_size);
+    }
+    void schedule(std::function<void()> callback) {
+        pool->enqueue(callback);
+    }
+};
 using Logger = std::function<void(const Request &, const Response &)>;
 
 using SocketOptions = std::function<void(socket_t sock)>;
@@ -865,6 +955,11 @@ public:
   virtual ~ClientImpl();
 
   virtual bool is_valid() const;
+
+  void GetAsync(const std::string &path, const ResponseCallback &callback, Scheduler* scheduler);
+  void GetAsync(const std::string &path, const Headers &headers, const ResponseCallback &callback, Scheduler* scheduler);
+  void GetAsync(const std::string &path, const Progress &progress, const ResponseCallback &callback, Scheduler* scheduler);
+  void GetAsync(const std::string &path, const Headers &headers, const Progress &progress, const ResponseCallback &callback, Scheduler* scheduler);
 
   Result Get(const std::string &path);
   Result Get(const std::string &path, const Headers &headers);
@@ -1227,6 +1322,11 @@ public:
   ~Client();
 
   bool is_valid() const;
+
+  void GetAsync(const std::string &path, const ResponseCallback &callback, Scheduler* scheduler);
+  void GetAsync(const std::string &path, const Headers &headers, const ResponseCallback &callback, Scheduler* scheduler);
+  void GetAsync(const std::string &path, const Progress &progress, const ResponseCallback &callback, Scheduler* scheduler);
+  void GetAsync(const std::string &path, const Headers &headers, const Progress &progress, const ResponseCallback &callback, Scheduler* scheduler);
 
   Result Get(const std::string &path);
   Result Get(const std::string &path, const Headers &headers);
@@ -6628,6 +6728,45 @@ ClientImpl::process_socket(const Socket &socket,
 
 inline bool ClientImpl::is_ssl() const { return false; }
 
+
+inline void ClientImpl::GetAsync(
+  const std::string& path,
+  const ResponseCallback& callback, 
+  Scheduler* scheduler = &(ThreadPoolScheduler::getInstance())
+){
+    GetAsync(path, Headers(), callback, scheduler);
+}
+
+inline void ClientImpl::GetAsync(
+  const std::string& path,
+  const Headers &headers, 
+  const ResponseCallback &callback, 
+  Scheduler* scheduler = &(ThreadPoolScheduler::getInstance())
+) {
+    GetAsync(path, headers, Progress(), callback, scheduler);
+}
+
+inline void ClientImpl::GetAsync(
+  const std::string &path, 
+  const Progress &progress, 
+  const ResponseCallback &callback, 
+  Scheduler* scheduler = &(ThreadPoolScheduler::getInstance())
+) {
+    GetAsync(path, Headers(), progress, callback, scheduler);
+}
+
+inline void ClientImpl::GetAsync(
+  const std::string &path, 
+  const Headers &headers, 
+  const Progress &progress, 
+  const ResponseCallback &callback, 
+  Scheduler* scheduler = &(ThreadPoolScheduler::getInstance())
+) {
+    scheduler->schedule([=, this]() {
+        callback(Get(path, headers, progress));
+    });
+}
+
 inline Result ClientImpl::Get(const std::string &path) {
   return Get(path, Headers(), Progress());
 }
@@ -8015,6 +8154,11 @@ inline Client::~Client() {}
 inline bool Client::is_valid() const {
   return cli_ != nullptr && cli_->is_valid();
 }
+
+inline void Client::GetAsync(const std::string &path, const ResponseCallback &callback, Scheduler* scheduler = &(ThreadPoolScheduler::getInstance())) { cli_->GetAsync(path, callback, scheduler); }
+inline void Client::GetAsync(const std::string &path, const Headers &headers, const ResponseCallback &callback, Scheduler* scheduler = &(ThreadPoolScheduler::getInstance())) { cli_->GetAsync(path, callback, scheduler); }
+inline void Client::GetAsync(const std::string &path, const Progress &progress, const ResponseCallback &callback, Scheduler* scheduler = &(ThreadPoolScheduler::getInstance())) { cli_->GetAsync(path, progress, callback, scheduler); }
+inline void Client::GetAsync(const std::string &path, const Headers &headers, const Progress &progress, const ResponseCallback &callback, Scheduler* scheduler = &(ThreadPoolScheduler::getInstance())){ cli_->GetAsync(path, headers, progress, callback, scheduler); }
 
 inline Result Client::Get(const std::string &path) { return cli_->Get(path); }
 inline Result Client::Get(const std::string &path, const Headers &headers) {
